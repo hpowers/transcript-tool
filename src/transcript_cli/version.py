@@ -23,6 +23,15 @@ def get_commit_hash() -> str | None:
 
     direct_url = Path(dist.locate_file("direct_url.json"))
     if not direct_url.exists():
+        direct_url = None
+        for file in dist.files or ():
+            if str(file).endswith("direct_url.json"):
+                candidate = Path(dist.locate_file(file))
+                if candidate.exists():
+                    direct_url = candidate
+                    break
+
+    if direct_url is None or not direct_url.exists():
         return None
 
     try:

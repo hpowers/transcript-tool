@@ -519,6 +519,36 @@ def test_get_commit_hash_reads_direct_url(monkeypatch, tmp_path: Path) -> None:
     assert get_commit_hash() == "abcdef0123456789"
 
 
+def test_get_commit_hash_falls_back_to_dist_info_direct_url(monkeypatch, tmp_path: Path) -> None:
+    direct_url = tmp_path / "transcribe-0.3.0.dist-info" / "direct_url.json"
+    direct_url.parent.mkdir()
+    direct_url.write_text(
+        json.dumps(
+            {
+                "url": "ssh://git@github.com/hpowers/transcript-tool.git",
+                "vcs_info": {"vcs": "git", "commit_id": "fedcba9876543210"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeDistribution:
+        files = [Path("transcribe-0.3.0.dist-info/direct_url.json")]
+
+        def locate_file(self, name: str | Path) -> Path:
+            if str(name) == "direct_url.json":
+                return tmp_path / "direct_url.json"
+            assert str(name) == "transcribe-0.3.0.dist-info/direct_url.json"
+            return direct_url
+
+    monkeypatch.setattr(
+        "transcript_cli.version.metadata.distribution",
+        lambda name: FakeDistribution(),
+    )
+
+    assert get_commit_hash() == "fedcba9876543210"
+
+
 def test_format_version_output_includes_short_commit(monkeypatch) -> None:
     monkeypatch.setattr("transcript_cli.version.get_version", lambda: "0.2.1")
     monkeypatch.setattr("transcript_cli.version.get_commit_hash", lambda: "abcdef0123456789")
