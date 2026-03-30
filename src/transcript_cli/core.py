@@ -8,6 +8,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -19,12 +22,33 @@ CONVERSATION_TRANSCRIPT_FILENAME = "transcript_conversation.txt"
 MERGED_AUDIO_FILENAME = "multichannel_input.wav"
 DEFAULT_MODEL_ID = "scribe_v2"
 TURN_GAP_SECONDS = 0.7
+SINGLE_SPEAKER_TURN_GAP_SECONDS = 3.0
+FILLER_MICRO_TURN_MAX_TOKENS = 3
+FILLER_TOKENS = {
+    "ah",
+    "eh",
+    "er",
+    "erm",
+    "hmm",
+    "hm",
+    "mhm",
+    "mm",
+    "mmhmm",
+    "mmhm",
+    "uh",
+    "uhhuh",
+    "uh-huh",
+    "um",
+}
 MULTICHANNEL_LAYOUTS = {
     2: "stereo",
     3: "3.0",
     4: "4.0",
     5: "5.0",
 }
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+Reporter = Callable[[str, str], None]
 
 
 class TranscriptCliError(Exception):
@@ -39,6 +63,8 @@ class TranscriptCliError(Exception):
 @dataclass(slots=True)
 class TranscriptTurn:
     speaker: str
+    start: float
+    end: float
     text: str
 
 
@@ -50,6 +76,7 @@ class TranscriptRunResult:
     merged_audio_path: Path | None
     speaker_labels: list[str]
     transcription_id: str | None
+    elapsed_seconds: float
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -69,6 +96,10 @@ def resolve_api_key(api_key: str | None) -> str:
             exit_code=2,
         )
     return resolved
+
+
+def detect_mode(audio_files: list[Path]) -> str:
+    return "diarized" if len(audio_files) == 1 else "multichannel"
 
 
 def validate_audio_files(audio_files: list[Path]) -> list[Path]:
@@ -95,6 +126,12 @@ def validate_audio_files(audio_files: list[Path]) -> list[Path]:
             exit_code=2,
         )
     return resolved
+
+
+def detect_speaker_labels(audio_files: list[Path]) -> list[str]:
+    if len(audio_files) <= 1:
+        return []
+    return [sanitize_speaker_name(path, index + 1) for index, path in enumerate(audio_files)]
 
 
 def ensure_output_paths(
@@ -152,7 +189,9 @@ def write_conversation(path: Path, turns: list[TranscriptTurn]) -> None:
     if not turns:
         path.write_text("No speech detected.\n", encoding="utf-8")
         return
-    rendered = "\n\n".join(f"{turn.speaker}: {turn.text}" for turn in turns)
+    rendered = "\n\n".join(
+        f"{turn.speaker} ({format_timestamp(turn.start)})\n{turn.text}" for turn in turns
+    )
     path.write_text(rendered + "\n", encoding="utf-8")
 
 
@@ -162,6 +201,31 @@ def sanitize_speaker_name(path: Path, index: int) -> str:
     if not cleaned:
         return f"Speaker {index}"
     return " ".join(part.capitalize() for part in cleaned.split(" "))
+
+
+def _run_with_heartbeat(
+    fn: Callable[[], dict[str, Any]],
+    *,
+    reporter: Reporter | None,
+) -> dict[str, Any]:
+    if reporter is None:
+        return fn()
+
+    start_time = time.monotonic()
+    stop_event = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+            elapsed = time.monotonic() - start_time
+            reporter("wait", f"Still waiting on ElevenLabs ({elapsed:.1f}s elapsed)")
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        return fn()
+    finally:
+        stop_event.set()
+        worker.join(timeout=0.1)
 
 
 def normalize_word_entries(
@@ -196,6 +260,7 @@ def build_turns(
     sorted_words = sorted(words, key=lambda item: (item["start"], item["end"]))
     turns: list[TranscriptTurn] = []
     current_speaker = sorted_words[0]["speaker"]
+    current_start = float(sorted_words[0]["start"])
     current_end = float(sorted_words[0]["end"])
     current_words = [str(sorted_words[0]["text"])]
 
@@ -210,13 +275,94 @@ def build_turns(
             current_end = max(current_end, end)
             continue
 
-        turns.append(TranscriptTurn(speaker=current_speaker, text=" ".join(current_words).strip()))
+        turns.append(
+            TranscriptTurn(
+                speaker=current_speaker,
+                start=current_start,
+                end=current_end,
+                text=" ".join(current_words).strip(),
+            )
+        )
         current_speaker = speaker
+        current_start = start
         current_end = end
         current_words = [text]
 
-    turns.append(TranscriptTurn(speaker=current_speaker, text=" ".join(current_words).strip()))
+    turns.append(
+        TranscriptTurn(
+            speaker=current_speaker,
+            start=current_start,
+            end=current_end,
+            text=" ".join(current_words).strip(),
+        )
+    )
     return turns
+
+
+def is_noise_only_turn(turn: TranscriptTurn) -> bool:
+    stripped = turn.text.strip()
+    if not stripped:
+        return True
+    cleaned = re.sub(r"\[[^\]]+\]", "", stripped)
+    return not cleaned.strip()
+
+
+def filter_noise_only_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+    return [turn for turn in turns if not is_noise_only_turn(turn)]
+
+
+def tokenize_turn_text(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", text.lower())
+
+
+def is_filler_micro_turn(turn: TranscriptTurn) -> bool:
+    tokens = tokenize_turn_text(turn.text)
+    if not tokens or len(tokens) > FILLER_MICRO_TURN_MAX_TOKENS:
+        return False
+    return all(token in FILLER_TOKENS for token in tokens)
+
+
+def filter_filler_micro_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+    return [turn for turn in turns if not is_filler_micro_turn(turn)]
+
+
+def merge_adjacent_same_speaker_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+    if not turns:
+        return []
+
+    merged: list[TranscriptTurn] = [turns[0]]
+    for turn in turns[1:]:
+        previous = merged[-1]
+        if previous.speaker != turn.speaker:
+            merged.append(turn)
+            continue
+        merged[-1] = TranscriptTurn(
+            speaker=previous.speaker,
+            start=previous.start,
+            end=max(previous.end, turn.end),
+            text=f"{previous.text} {turn.text}".strip(),
+        )
+    return merged
+
+
+def format_timestamp(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    remaining_seconds = seconds - (minutes * 60)
+    return f"{minutes:02d}:{remaining_seconds:05.2f}"
+
+
+def build_readable_turns(
+    turns: list[TranscriptTurn],
+    *,
+    merge_same_speaker: bool,
+) -> list[TranscriptTurn]:
+    filtered_turns = filter_filler_micro_turns(filter_noise_only_turns(turns))
+    if not filtered_turns:
+        return []
+
+    if not merge_same_speaker:
+        return filtered_turns
+    return merge_adjacent_same_speaker_turns(filtered_turns)
 
 
 def build_single_file_turns(payload: dict[str, Any]) -> tuple[list[TranscriptTurn], list[str]]:
@@ -227,8 +373,11 @@ def build_single_file_turns(payload: dict[str, Any]) -> tuple[list[TranscriptTur
         if speaker_id not in label_map:
             label_map[speaker_id] = f"Speaker {len(label_map) + 1}"
 
-    turns = build_turns(normalize_word_entries(words, label_map))
-    return turns, list(label_map.values())
+    speaker_count = len(label_map) or 1
+    turn_gap_seconds = SINGLE_SPEAKER_TURN_GAP_SECONDS if speaker_count == 1 else TURN_GAP_SECONDS
+    turns = build_turns(normalize_word_entries(words, label_map), turn_gap_seconds=turn_gap_seconds)
+    readable_turns = build_readable_turns(turns, merge_same_speaker=speaker_count > 1)
+    return readable_turns, list(label_map.values())
 
 
 def build_multi_file_turns(
@@ -252,7 +401,7 @@ def build_multi_file_turns(
             words.append(normalized_word)
 
     turns = build_turns(normalize_word_entries(words, label_map))
-    return turns, speaker_labels
+    return build_readable_turns(turns, merge_same_speaker=True), speaker_labels
 
 
 def require_ffmpeg() -> None:
@@ -297,43 +446,70 @@ def merge_to_multichannel(audio_files: list[Path], output_path: Path) -> Path:
         subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() or "ffmpeg failed without stderr output."
-        raise TranscriptCliError(
-            f"Failed to merge audio into multichannel WAV: {stderr}",
-            exit_code=3,
-        ) from exc
+        raise TranscriptCliError(f"merge failed: {stderr}", exit_code=3) from exc
 
     return output_path
 
 
-def transcribe_single_file(audio_file: Path, api_key: str) -> dict[str, Any]:
+def transcribe_single_file(
+    audio_file: Path,
+    api_key: str,
+    *,
+    reporter: Reporter | None = None,
+) -> dict[str, Any]:
     client = create_client(api_key)
-    try:
-        with audio_file.open("rb") as handle:
-            response = client.speech_to_text.convert(
-                file=handle,
-                model_id=DEFAULT_MODEL_ID,
-                diarize=True,
-                timestamps_granularity="word",
-            )
-    except Exception as exc:  # noqa: BLE001
-        raise TranscriptCliError(f"ElevenLabs transcription failed: {exc}", exit_code=4) from exc
-    return cast(dict[str, Any], to_jsonable(response))
+    if reporter is not None:
+        reporter(
+            "transcription",
+            "Uploading audio to ElevenLabs and starting diarized transcription",
+        )
+        reporter("wait", "Waiting on ElevenLabs")
+
+    def perform_request() -> dict[str, Any]:
+        try:
+            with audio_file.open("rb") as handle:
+                response = client.speech_to_text.convert(
+                    file=handle,
+                    model_id=DEFAULT_MODEL_ID,
+                    diarize=True,
+                    timestamps_granularity="word",
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise TranscriptCliError(f"transcription request failed: {exc}", exit_code=4) from exc
+        return cast(dict[str, Any], to_jsonable(response))
+
+    return _run_with_heartbeat(perform_request, reporter=reporter)
 
 
-def transcribe_multi_file(audio_file: Path, api_key: str) -> dict[str, Any]:
+def transcribe_multi_file(
+    audio_file: Path,
+    api_key: str,
+    *,
+    reporter: Reporter | None = None,
+) -> dict[str, Any]:
     client = create_client(api_key)
-    try:
-        with audio_file.open("rb") as handle:
-            response = client.speech_to_text.convert(
-                file=handle,
-                model_id=DEFAULT_MODEL_ID,
-                use_multi_channel=True,
-                diarize=False,
-                timestamps_granularity="word",
-            )
-    except Exception as exc:  # noqa: BLE001
-        raise TranscriptCliError(f"ElevenLabs transcription failed: {exc}", exit_code=4) from exc
-    return cast(dict[str, Any], to_jsonable(response))
+    if reporter is not None:
+        reporter(
+            "transcription",
+            "Uploading multichannel audio to ElevenLabs and starting transcription",
+        )
+        reporter("wait", "Waiting on ElevenLabs")
+
+    def perform_request() -> dict[str, Any]:
+        try:
+            with audio_file.open("rb") as handle:
+                response = client.speech_to_text.convert(
+                    file=handle,
+                    model_id=DEFAULT_MODEL_ID,
+                    use_multi_channel=True,
+                    diarize=False,
+                    timestamps_granularity="word",
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise TranscriptCliError(f"transcription request failed: {exc}", exit_code=4) from exc
+        return cast(dict[str, Any], to_jsonable(response))
+
+    return _run_with_heartbeat(perform_request, reporter=reporter)
 
 
 def run_transcription(
@@ -343,24 +519,41 @@ def run_transcription(
     api_key: str | None = None,
     force: bool = False,
     keep_merged_audio: bool = False,
+    reporter: Reporter | None = None,
 ) -> TranscriptRunResult:
-    resolved_files = validate_audio_files(audio_files)
-    resolved_api_key = resolve_api_key(api_key)
-    raw_path, conversation_path, persisted_merged_path = ensure_output_paths(
-        output_dir,
-        force=force,
-        keep_merged_audio=keep_merged_audio,
-    )
+    started_at = time.monotonic()
+    if reporter is not None:
+        reporter("preflight", "Validating inputs and configuration")
+
+    try:
+        resolved_files = validate_audio_files(audio_files)
+        resolved_api_key = resolve_api_key(api_key)
+        raw_path, conversation_path, persisted_merged_path = ensure_output_paths(
+            output_dir,
+            force=force,
+            keep_merged_audio=keep_merged_audio,
+        )
+    except TranscriptCliError as exc:
+        raise TranscriptCliError(
+            f"validation failed: {exc.message}",
+            exit_code=exc.exit_code,
+        ) from exc
 
     merged_temp_path: Path | None = None
     payload: dict[str, Any]
-    speaker_labels: list[str]
+    speaker_labels = detect_speaker_labels(resolved_files)
     transcription_id: str | None
-    mode = "diarized" if len(resolved_files) == 1 else "multichannel"
+    mode = detect_mode(resolved_files)
+    if reporter is not None:
+        reporter("mode", f"Mode: {mode}")
 
     try:
         if len(resolved_files) == 1:
-            payload = transcribe_single_file(resolved_files[0], resolved_api_key)
+            payload = transcribe_single_file(
+                resolved_files[0],
+                resolved_api_key,
+                reporter=reporter,
+            )
             turns, speaker_labels = build_single_file_turns(payload)
         else:
             if persisted_merged_path is not None:
@@ -374,15 +567,29 @@ def run_transcription(
                 ) as temp_file:
                     merged_temp_path = Path(temp_file.name)
 
+            if reporter is not None:
+                reporter("merge", "Merging speaker tracks into a multichannel WAV")
             merge_to_multichannel(resolved_files, merged_temp_path)
-            payload = transcribe_multi_file(merged_temp_path, resolved_api_key)
+            if reporter is not None:
+                reporter("merge", "Multichannel merge complete")
+            payload = transcribe_multi_file(
+                merged_temp_path,
+                resolved_api_key,
+                reporter=reporter,
+            )
             turns, speaker_labels = build_multi_file_turns(payload, resolved_files)
     finally:
         if not keep_merged_audio and merged_temp_path is not None and merged_temp_path.exists():
             merged_temp_path.unlink()
 
-    write_json(raw_path, payload)
-    write_conversation(conversation_path, turns)
+    try:
+        if reporter is not None:
+            reporter("write", "Writing transcript artifacts")
+        write_json(raw_path, payload)
+        write_conversation(conversation_path, turns)
+    except OSError as exc:
+        raise TranscriptCliError(f"output write failed: {exc}", exit_code=5) from exc
+
     transcription_id = (
         str(payload.get("transcription_id")) if payload.get("transcription_id") else None
     )
@@ -394,4 +601,5 @@ def run_transcription(
         merged_audio_path=persisted_merged_path,
         speaker_labels=speaker_labels,
         transcription_id=transcription_id,
+        elapsed_seconds=time.monotonic() - started_at,
     )

@@ -8,7 +8,12 @@ from typing import Annotated
 
 import typer
 
-from transcript_cli.core import TranscriptCliError, run_transcription
+from transcript_cli.core import (
+    TranscriptCliError,
+    detect_mode,
+    detect_speaker_labels,
+    run_transcription,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -68,6 +73,18 @@ def main(
 ) -> None:
     """Generate transcript artifacts for the given audio files."""
 
+    def report(stage: str, message: str) -> None:
+        typer.secho(f"[{stage}] {message}", err=True, fg=typer.colors.BLUE)
+
+    report(
+        "preflight",
+        f"Starting {detect_mode(audio_files)} transcription for {len(audio_files)} input file(s)",
+    )
+    report("preflight", f"Output directory: {output_dir.resolve()}")
+    speaker_labels = detect_speaker_labels(audio_files)
+    if speaker_labels:
+        report("preflight", f"Detected speakers: {', '.join(speaker_labels)}")
+
     try:
         result = run_transcription(
             audio_files,
@@ -75,6 +92,7 @@ def main(
             api_key=api_key,
             force=force,
             keep_merged_audio=keep_merged_audio,
+            reporter=report,
         )
     except TranscriptCliError as exc:
         if json_output:
@@ -96,3 +114,4 @@ def main(
         typer.echo(f"Speakers: {', '.join(result.speaker_labels)}")
     if result.transcription_id:
         typer.echo(f"Transcription ID: {result.transcription_id}")
+    typer.echo(f"Elapsed: {result.elapsed_seconds:.1f}s")

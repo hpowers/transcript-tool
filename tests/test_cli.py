@@ -23,6 +23,7 @@ def test_cli_json_output(monkeypatch, tmp_path: Path) -> None:
             merged_audio_path=None,
             speaker_labels=["Speaker 1", "Speaker 2"],
             transcription_id="abc123",
+            elapsed_seconds=12.5,
         )
 
     monkeypatch.setattr("transcript_cli.cli.run_transcription", fake_run_transcription)
@@ -33,6 +34,7 @@ def test_cli_json_output(monkeypatch, tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["mode"] == "diarized"
     assert payload["speaker_labels"] == ["Speaker 1", "Speaker 2"]
+    assert "[preflight]" in result.stderr
 
 
 def test_cli_human_output(monkeypatch, tmp_path: Path) -> None:
@@ -49,6 +51,7 @@ def test_cli_human_output(monkeypatch, tmp_path: Path) -> None:
             merged_audio_path=tmp_path / "multichannel_input.wav",
             speaker_labels=["Hunter", "Daniel"],
             transcription_id="xyz789",
+            elapsed_seconds=9.0,
         )
 
     monkeypatch.setattr("transcript_cli.cli.run_transcription", fake_run_transcription)
@@ -58,6 +61,8 @@ def test_cli_human_output(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "Mode: multichannel" in result.stdout
     assert "Speakers: Hunter, Daniel" in result.stdout
+    assert "Elapsed:" in result.stdout
+    assert "[preflight]" in result.stderr
 
 
 def test_cli_returns_structured_json_errors(monkeypatch, tmp_path: Path) -> None:
@@ -74,3 +79,19 @@ def test_cli_returns_structured_json_errors(monkeypatch, tmp_path: Path) -> None
     assert result.exit_code == 2
     payload = json.loads(result.stdout)
     assert payload == {"error": "broken input", "exit_code": 2}
+    assert "[preflight]" in result.stderr
+
+
+def test_cli_reports_stage_aware_errors(monkeypatch, tmp_path: Path) -> None:
+    input_file = tmp_path / "episode.mp3"
+    input_file.write_text("audio", encoding="utf-8")
+
+    def fake_run_transcription(*args, **kwargs) -> TranscriptRunResult:
+        raise TranscriptCliError("transcription request failed: timeout", exit_code=4)
+
+    monkeypatch.setattr("transcript_cli.cli.run_transcription", fake_run_transcription)
+
+    result = runner.invoke(app, [str(input_file)])
+
+    assert result.exit_code == 4
+    assert "Error: transcription request failed: timeout" in result.stderr

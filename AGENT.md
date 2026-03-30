@@ -18,6 +18,8 @@ uv sync --group dev
 
 ```bash
 uv run transcribe --help
+make install-tool
+make upgrade-tool
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src

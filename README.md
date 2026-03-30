@@ -13,17 +13,50 @@
 
 ## Installation
 
-Install as a local tool with `uv`:
+Install from GitHub with `uv`:
 
 ```bash
-uv tool install .
+uv tool install git+ssh://git@github.com/hpowers/transcript-tool.git
 ```
 
-Or run it directly from the repo:
+Update the installed tool to the latest version from GitHub:
+
+```bash
+make upgrade-tool
+```
+
+Or equivalently:
+
+```bash
+uv tool upgrade transcribe
+```
+
+## Running The Latest Local Code
+
+When you run the globally installed command:
+
+```bash
+transcribe ...
+```
+
+you are using the GitHub-installed tool on your `PATH`, not the current working tree in this repo.
+
+To run the current repo version directly, use:
 
 ```bash
 uv run transcribe --help
 ```
+
+or:
+
+```bash
+uv run python -m transcript_cli --help
+```
+
+Recommended workflow:
+
+- during development: use `uv run transcribe ...`
+- when you want to refresh the globally installed command from GitHub: run `make upgrade-tool`
 
 ## Usage
 
@@ -86,6 +119,18 @@ Install dev dependencies:
 uv sync --group dev
 ```
 
+Install the globally available CLI from GitHub:
+
+```bash
+make install-tool
+```
+
+Upgrade the installed CLI from GitHub:
+
+```bash
+make upgrade-tool
+```
+
 Run checks:
 
 ```bash
@@ -94,4 +139,3 @@ uv run ruff format --check .
 uv run mypy src
 uv run pytest
 ```
-

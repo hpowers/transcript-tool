@@ -3,8 +3,8 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "transcript-cli"
-version = "0.1.0"
+name = "transcribe"
+version = "0.2.0"
 description = "CLI for generating ElevenLabs transcripts from single or multitrack audio inputs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,4 +47,3 @@ packages = ["transcript_cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
