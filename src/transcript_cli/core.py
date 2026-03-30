@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,8 +23,13 @@ MERGED_AUDIO_FILENAME = "multichannel_input.wav"
 DEFAULT_MODEL_ID = "scribe_v2"
 TURN_GAP_SECONDS = 0.7
 SINGLE_SPEAKER_TURN_GAP_SECONDS = 3.0
-FILLER_MICRO_TURN_MAX_TOKENS = 3
-FILLER_TOKENS = {
+DISPOSABLE_MICRO_TURN_MAX_TOKENS = 3
+SUBSTANTIVE_TURN_MIN_TOKENS = 4
+READABLE_MERGE_GAP_SECONDS = 6.0
+SUBSTANTIVE_LOOKAHEAD_SECONDS = 30.0
+CLAUSE_REPAIR_LOOKAHEAD_SECONDS = 12.0
+CLAUSE_REPAIR_MAX_INTERVENING_TURNS = 2
+FILLER_LEAD_IN_PHRASES = {
     "ah",
     "eh",
     "er",
@@ -39,6 +44,130 @@ FILLER_TOKENS = {
     "uhhuh",
     "uh-huh",
     "um",
+    "you know",
+    "i mean",
+}
+INLINE_FILLER_WORDS = {
+    "ah",
+    "eh",
+    "er",
+    "erm",
+    "hm",
+    "hmm",
+    "mhm",
+    "mm",
+    "mmhm",
+    "mmhmm",
+    "uh",
+    "um",
+}
+BACKCHANNEL_PHRASES = {
+    "all right",
+    "hey",
+    "okay",
+    "ok",
+    "right",
+    "uh huh",
+    "well",
+    "yeah",
+    "yep",
+    "yes",
+}
+BACKCHANNEL_TOKENS = {
+    "all",
+    "hey",
+    "huh",
+    "hmm",
+    "mhm",
+    "mm",
+    "mmhm",
+    "mmhmm",
+    "ok",
+    "okay",
+    "right",
+    "uh",
+    "well",
+    "yeah",
+    "yep",
+    "yes",
+}
+FRAGMENT_PHRASES = {
+    "did",
+    "i",
+    "opening",
+    "otherwise",
+}
+FRAGMENT_TOKENS = {
+    "am",
+    "are",
+    "did",
+    "do",
+    "does",
+    "had",
+    "has",
+    "have",
+    "he",
+    "i",
+    "is",
+    "it",
+    "she",
+    "that",
+    "there",
+    "they",
+    "this",
+    "was",
+    "we",
+    "were",
+    "you",
+}
+CLAUSE_CONTINUATION_STARTERS = {
+    "and",
+    "because",
+    "but",
+    "for",
+    "if",
+    "it",
+    "or",
+    "so",
+    "that",
+    "the",
+    "they",
+    "this",
+    "to",
+    "we",
+    "which",
+}
+INCOMPLETE_ENDING_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "because",
+    "but",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "so",
+    "that",
+    "the",
+    "their",
+    "there",
+    "these",
+    "this",
+    "those",
+    "to",
+    "was",
+    "were",
+    "with",
 }
 MULTICHANNEL_LAYOUTS = {
     2: "stereo",
@@ -234,6 +363,8 @@ def normalize_word_entries(
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for word in words:
+        if str(word.get("type", "word")) == "audio_event":
+            continue
         text = str(word.get("text", "")).strip()
         if not text:
             continue
@@ -299,6 +430,26 @@ def build_turns(
     return turns
 
 
+def build_turns_by_speaker(
+    words: list[dict[str, Any]],
+    *,
+    turn_gap_seconds: float = TURN_GAP_SECONDS,
+) -> list[TranscriptTurn]:
+    if not words:
+        return []
+
+    words_by_speaker: dict[str, list[dict[str, Any]]] = {}
+    for word in words:
+        speaker = str(word["speaker"])
+        words_by_speaker.setdefault(speaker, []).append(word)
+
+    turns: list[TranscriptTurn] = []
+    for speaker_words in words_by_speaker.values():
+        turns.extend(build_turns(speaker_words, turn_gap_seconds=turn_gap_seconds))
+
+    return sorted(turns, key=lambda turn: (turn.start, turn.end, turn.speaker))
+
+
 def is_noise_only_turn(turn: TranscriptTurn) -> bool:
     stripped = turn.text.strip()
     if not stripped:
@@ -307,26 +458,321 @@ def is_noise_only_turn(turn: TranscriptTurn) -> bool:
     return not cleaned.strip()
 
 
-def filter_noise_only_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
-    return [turn for turn in turns if not is_noise_only_turn(turn)]
+def strip_non_speech_markers(text: str) -> str:
+    return re.sub(r"\[[^\]]+\]", " ", text)
 
 
 def tokenize_turn_text(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9']+", text.lower())
 
 
-def is_filler_micro_turn(turn: TranscriptTurn) -> bool:
-    tokens = tokenize_turn_text(turn.text)
-    if not tokens or len(tokens) > FILLER_MICRO_TURN_MAX_TOKENS:
+def normalize_turn_phrase(text: str) -> str:
+    return " ".join(tokenize_turn_text(text))
+
+
+def is_backchannel_text(text: str) -> bool:
+    tokens = tokenize_turn_text(text)
+    if not tokens:
         return False
-    return all(token in FILLER_TOKENS for token in tokens)
+    normalized = " ".join(tokens)
+    return normalized in BACKCHANNEL_PHRASES or all(token in BACKCHANNEL_TOKENS for token in tokens)
 
 
-def filter_filler_micro_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
-    return [turn for turn in turns if not is_filler_micro_turn(turn)]
+def collapse_stutter_prefix(text: str) -> str:
+    repeated_token_pattern = re.compile(
+        r"^([A-Za-z0-9']+)(?:,\s*\1\b)+(?=(?:\s|[.?!,]|$))",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        collapsed = repeated_token_pattern.sub(r"\1", text, count=1)
+        if collapsed == text:
+            return text
+        text = collapsed.lstrip()
 
 
-def merge_adjacent_same_speaker_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+def remove_filler_lead_ins(text: str) -> str:
+    cleaned = text
+    filler_pattern = "|".join(
+        sorted((re.escape(phrase) for phrase in FILLER_LEAD_IN_PHRASES), key=len, reverse=True)
+    )
+    lead_in_pattern = re.compile(
+        rf"(^|(?<=[.?!])\s+|(?<=\.\.\.)\s+|(?<=--)\s+)"
+        rf"(?:(?:{filler_pattern})(?:\s*,)?(?:\s+|$))+",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        updated = lead_in_pattern.sub(r"\1", cleaned)
+        if updated == cleaned:
+            return cleaned
+        cleaned = updated
+
+
+def clean_turn_text(text: str) -> str:
+    cleaned = strip_non_speech_markers(text).strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = remove_filler_lead_ins(cleaned)
+    cleaned = collapse_stutter_prefix(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,")
+    return cleaned.strip()
+
+
+def collapse_repeated_tokens(text: str) -> str:
+    repeated_token_pattern = re.compile(
+        r"\b([A-Za-z0-9']{1,12})(?:,\s*|\s+)\1\b",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        collapsed = repeated_token_pattern.sub(r"\1", text)
+        if collapsed == text:
+            return text
+        text = collapsed
+
+
+def remove_inline_fillers(text: str) -> str:
+    filler_pattern = "|".join(
+        sorted((re.escape(phrase) for phrase in FILLER_LEAD_IN_PHRASES), key=len, reverse=True)
+    )
+    cleaned = re.sub(
+        rf"(?<=[,;:])\s*(?:{filler_pattern})\s+(?=[A-Za-z])",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    inline_word_pattern = "|".join(
+        sorted((re.escape(word) for word in INLINE_FILLER_WORDS), key=len, reverse=True)
+    )
+    filler_sequence = rf"(?:{inline_word_pattern})(?:\s*,\s*(?:{inline_word_pattern}))*"
+    cleaned = re.sub(
+        rf",\s*{filler_sequence}\s*,\s*(?=(?:and|but|or)\b)",
+        ", ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        rf",\s*{filler_sequence}\s*,\s*",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        rf"\s+{filler_sequence}\s+",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        rf"(?:(?<=^)|(?<=[\s,;:]))(?:{inline_word_pattern})(?:(?=[,;:])|(?=\s)|(?=$))",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r",\s*,", ", ", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s+([.!?])", r"\1", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def repair_text_after_cleanup(text: str) -> str:
+    repaired = text.strip()
+    if not repaired:
+        return ""
+
+    repaired = re.sub(r"\b([A-Za-z]{1,4})-\s+([A-Za-z][a-z]+)\b", r"\2", repaired)
+    repaired = re.sub(r"\b([A-Za-z]{1,2})-([A-Za-z][a-z]+)\b", r"\2", repaired)
+    repaired = remove_inline_fillers(repaired)
+    repaired = collapse_repeated_tokens(repaired)
+    repaired = re.sub(r"([,;:])(?=[A-Za-z])", r"\1 ", repaired)
+    repaired = re.sub(r"([.!?])(?=[A-Za-z])", r"\1 ", repaired)
+    repaired = re.sub(r"(?<=[a-z])(?=[A-Z][a-z])", " ", repaired)
+    repaired = re.sub(r"\b(from|into|with|about|for|to)([A-Z]{2,})\b", r"\1 \2", repaired)
+    repaired = re.sub(r"\s+", " ", repaired).strip()
+
+    repaired = re.sub(
+        r"(^|(?<=[.!?]\s))([a-z])",
+        lambda match: match.group(1) + match.group(2).upper(),
+        repaired,
+    )
+    repaired = re.sub(
+        r'([.!?]["\']?\s+)([a-z])',
+        lambda match: match.group(1) + match.group(2).upper(),
+        repaired,
+    )
+    return repaired.strip(" ,")
+
+
+def is_clause_repair_source_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("...", "--", "-", ",", ":", ";")):
+        return True
+    if stripped.count('"') % 2 == 1:
+        return True
+    tokens = tokenize_turn_text(stripped)
+    return len(tokens) <= 8 and bool(tokens and tokens[-1] in INCOMPLETE_ENDING_TOKENS)
+
+
+def starts_with_continuation(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    stripped = stripped.lstrip("\"'([{")
+    if not stripped:
+        return False
+    tokens = tokenize_turn_text(stripped)
+    if not tokens:
+        return False
+    return stripped[0].islower() or tokens[0] in CLAUSE_CONTINUATION_STARTERS
+
+
+def extract_leading_completion(text: str) -> tuple[str, str]:
+    stripped = text.strip()
+    if not stripped:
+        return "", ""
+
+    sentence_match = re.match(r'.*?[.!?]["\']?(?:\s+|$)', stripped)
+    if sentence_match is not None:
+        prefix = sentence_match.group(0).strip()
+        if prefix and len(tokenize_turn_text(prefix)) <= 40:
+            remainder = stripped[sentence_match.end() :].strip()
+            return prefix, remainder
+
+    if len(tokenize_turn_text(stripped)) <= 12:
+        return stripped, ""
+    return "", stripped
+
+
+def repair_interrupted_same_speaker_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+    if not turns:
+        return []
+
+    repaired_turns = list(turns)
+    for index, turn in enumerate(repaired_turns):
+        if not is_clause_repair_source_text(turn.text):
+            continue
+
+        same_speaker_seen = 0
+        for next_index in range(index + 1, len(repaired_turns)):
+            candidate = repaired_turns[next_index]
+            if candidate.speaker == turn.speaker:
+                same_speaker_seen += 1
+            if same_speaker_seen > CLAUSE_REPAIR_MAX_INTERVENING_TURNS + 1:
+                break
+            if candidate.start - turn.end > CLAUSE_REPAIR_LOOKAHEAD_SECONDS:
+                break
+            if candidate.speaker != turn.speaker or not starts_with_continuation(candidate.text):
+                continue
+            if all(
+                repaired_turns[between_index].speaker == turn.speaker
+                for between_index in range(index + 1, next_index)
+            ):
+                continue
+
+            prefix, remainder = extract_leading_completion(candidate.text)
+            if not prefix:
+                continue
+
+            updated_text = repair_text_after_cleanup(f"{turn.text} {prefix}")
+            repaired_turns[index] = replace(
+                turn,
+                text=updated_text,
+                end=max(turn.end, candidate.end if not remainder else turn.end),
+            )
+            repaired_turns[next_index] = replace(
+                candidate,
+                text=repair_text_after_cleanup(remainder),
+            )
+            break
+
+    return [turn for turn in repaired_turns if turn.text]
+
+
+def finalize_turn_text(text: str) -> str:
+    finalized = clean_turn_text(text)
+    finalized = repair_text_after_cleanup(finalized)
+    return finalized.strip()
+
+
+def is_substantive_turn(turn: TranscriptTurn) -> bool:
+    text = turn.text.strip()
+    tokens = tokenize_turn_text(text)
+    if not tokens:
+        return False
+    if text.endswith("?"):
+        return True
+    if len(tokens) >= SUBSTANTIVE_TURN_MIN_TOKENS:
+        return True
+    normalized = normalize_turn_phrase(text)
+    if is_backchannel_text(text) or normalized in FRAGMENT_PHRASES:
+        return False
+    if normalized == normalize_turn_phrase(turn.speaker):
+        return False
+    if len(tokens) == 1 and tokens[0] in FRAGMENT_TOKENS:
+        return False
+    if len(tokens) <= DISPOSABLE_MICRO_TURN_MAX_TOKENS and tokens[-1] in FRAGMENT_TOKENS:
+        return False
+    return not ("..." in text or "--" in text)
+
+
+def is_disposable_micro_turn(turn: TranscriptTurn) -> bool:
+    text = turn.text.strip()
+    tokens = tokenize_turn_text(text)
+    if not tokens or len(tokens) > DISPOSABLE_MICRO_TURN_MAX_TOKENS or text.endswith("?"):
+        return False
+
+    normalized = normalize_turn_phrase(text)
+    if is_backchannel_text(text):
+        return True
+    if normalized == normalize_turn_phrase(turn.speaker):
+        return True
+    if normalized in FRAGMENT_PHRASES:
+        return True
+    if len(tokens) == 1 and tokens[0] in FRAGMENT_TOKENS:
+        return True
+    if tokens[-1] in FRAGMENT_TOKENS:
+        return True
+    if len(tokens) <= 2 and tokens[0] in CLAUSE_CONTINUATION_STARTERS:
+        return True
+    return "..." in text or "--" in text
+
+
+def drop_disposable_micro_turns(turns: list[TranscriptTurn]) -> list[TranscriptTurn]:
+    if not turns:
+        return []
+
+    substantive_indices = [index for index, turn in enumerate(turns) if is_substantive_turn(turn)]
+    kept_turns: list[TranscriptTurn] = []
+    for index, turn in enumerate(turns):
+        if not is_disposable_micro_turn(turn):
+            kept_turns.append(turn)
+            continue
+
+        fully_overlapped = any(
+            other_index != index
+            and turns[other_index].speaker != turn.speaker
+            and turns[other_index].start <= turn.start
+            and turns[other_index].end >= turn.end
+            for other_index in substantive_indices
+        )
+        same_speaker_future_substantive = any(
+            turns[other_index].speaker == turn.speaker
+            and turns[other_index].start >= turn.start
+            and (turns[other_index].start - turn.end) <= SUBSTANTIVE_LOOKAHEAD_SECONDS
+            for other_index in substantive_indices
+        )
+        if fully_overlapped or same_speaker_future_substantive:
+            continue
+        kept_turns.append(turn)
+    return kept_turns
+
+
+def merge_adjacent_same_speaker_turns(
+    turns: list[TranscriptTurn],
+    *,
+    max_gap_seconds: float | None = None,
+) -> list[TranscriptTurn]:
     if not turns:
         return []
 
@@ -334,6 +780,10 @@ def merge_adjacent_same_speaker_turns(turns: list[TranscriptTurn]) -> list[Trans
     for turn in turns[1:]:
         previous = merged[-1]
         if previous.speaker != turn.speaker:
+            merged.append(turn)
+            continue
+        gap = turn.start - previous.end
+        if max_gap_seconds is not None and gap > max_gap_seconds:
             merged.append(turn)
             continue
         merged[-1] = TranscriptTurn(
@@ -356,13 +806,41 @@ def build_readable_turns(
     *,
     merge_same_speaker: bool,
 ) -> list[TranscriptTurn]:
-    filtered_turns = filter_filler_micro_turns(filter_noise_only_turns(turns))
-    if not filtered_turns:
+    cleaned_turns = [
+        TranscriptTurn(
+            speaker=turn.speaker,
+            start=turn.start,
+            end=turn.end,
+            text=clean_turn_text(turn.text),
+        )
+        for turn in turns
+    ]
+    filtered_turns = [turn for turn in cleaned_turns if turn.text and not is_noise_only_turn(turn)]
+    readable_turns = repair_interrupted_same_speaker_turns(
+        drop_disposable_micro_turns(filtered_turns)
+    )
+    if not readable_turns:
         return []
 
     if not merge_same_speaker:
-        return filtered_turns
-    return merge_adjacent_same_speaker_turns(filtered_turns)
+        finalized_turns: list[TranscriptTurn] = []
+        for turn in readable_turns:
+            finalized_text = finalize_turn_text(turn.text)
+            if not finalized_text:
+                continue
+            finalized_turns.append(replace(turn, text=finalized_text))
+        return finalized_turns
+    merged_turns = merge_adjacent_same_speaker_turns(
+        readable_turns,
+        max_gap_seconds=READABLE_MERGE_GAP_SECONDS,
+    )
+    finalized_turns: list[TranscriptTurn] = []
+    for turn in merged_turns:
+        finalized_text = finalize_turn_text(turn.text)
+        if not finalized_text:
+            continue
+        finalized_turns.append(replace(turn, text=finalized_text))
+    return finalized_turns
 
 
 def build_single_file_turns(payload: dict[str, Any]) -> tuple[list[TranscriptTurn], list[str]]:
@@ -400,7 +878,7 @@ def build_multi_file_turns(
             normalized_word.setdefault("speaker_id", speaker_id)
             words.append(normalized_word)
 
-    turns = build_turns(normalize_word_entries(words, label_map))
+    turns = build_turns_by_speaker(normalize_word_entries(words, label_map))
     return build_readable_turns(turns, merge_same_speaker=True), speaker_labels
 
 
