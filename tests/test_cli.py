@@ -11,6 +11,27 @@ from transcript_cli.core import TranscriptCliError, TranscriptRunResult
 runner = CliRunner()
 
 
+def test_cli_version_flag(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "transcript_cli.cli.format_version_output",
+        lambda: "transcribe 0.2.1 (abcdef0)",
+    )
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "transcribe 0.2.1 (abcdef0)"
+
+
+def test_cli_short_version_flag(monkeypatch) -> None:
+    monkeypatch.setattr("transcript_cli.cli.format_version_output", lambda: "transcribe 0.2.1")
+
+    result = runner.invoke(app, ["-V"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "transcribe 0.2.1"
+
+
 def test_cli_json_output(monkeypatch, tmp_path: Path) -> None:
     input_file = tmp_path / "episode.mp3"
     input_file.write_text("audio", encoding="utf-8")

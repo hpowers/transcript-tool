@@ -3,3 +3,12 @@ install-tool:
 
 upgrade-tool:
 	uv tool upgrade transcribe
+
+release-patch:
+	python scripts/bump_version.py patch
+
+release-minor:
+	python scripts/bump_version.py minor
+
+release-major:
+	python scripts/bump_version.py major

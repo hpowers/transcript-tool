@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from transcript_cli.core import (
     validate_audio_files,
     write_conversation,
 )
+from transcript_cli.version import format_version_output, get_commit_hash, get_version
 
 
 def test_sanitize_speaker_name_uses_filename_stem() -> None:
@@ -483,3 +486,82 @@ def test_ensure_output_paths_requires_force_for_existing_files(tmp_path: Path) -
 
     with pytest.raises(TranscriptCliError, match="Pass --force"):
         ensure_output_paths(tmp_path, force=False, keep_merged_audio=False)
+
+
+def test_get_version_reads_package_metadata(monkeypatch) -> None:
+    monkeypatch.setattr("transcript_cli.version.metadata.version", lambda name: "0.2.1")
+
+    assert get_version() == "0.2.1"
+
+
+def test_get_commit_hash_reads_direct_url(monkeypatch, tmp_path: Path) -> None:
+    direct_url = tmp_path / "direct_url.json"
+    direct_url.write_text(
+        json.dumps(
+            {
+                "url": "ssh://git@github.com/hpowers/transcript-tool.git",
+                "vcs_info": {"vcs": "git", "commit_id": "abcdef0123456789"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeDistribution:
+        def locate_file(self, name: str) -> Path:
+            assert name == "direct_url.json"
+            return direct_url
+
+    monkeypatch.setattr(
+        "transcript_cli.version.metadata.distribution",
+        lambda name: FakeDistribution(),
+    )
+
+    assert get_commit_hash() == "abcdef0123456789"
+
+
+def test_format_version_output_includes_short_commit(monkeypatch) -> None:
+    monkeypatch.setattr("transcript_cli.version.get_version", lambda: "0.2.1")
+    monkeypatch.setattr("transcript_cli.version.get_commit_hash", lambda: "abcdef0123456789")
+
+    assert format_version_output() == "transcribe 0.2.1 (abcdef0)"
+
+
+def test_format_version_output_omits_commit_when_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr("transcript_cli.version.get_version", lambda: "0.2.1")
+    monkeypatch.setattr("transcript_cli.version.get_commit_hash", lambda: None)
+
+    assert format_version_output() == "transcribe 0.2.1"
+
+
+def test_package_init_does_not_define_stale_hard_coded_version() -> None:
+    init_source = Path("src/transcript_cli/__init__.py").read_text(encoding="utf-8")
+
+    assert "from transcript_cli.version import __version__" in init_source
+    assert '__version__ = "' not in init_source
+
+
+def test_release_bump_script_updates_pyproject_version(tmp_path: Path) -> None:
+    source = Path("scripts/bump_version.py").read_text(encoding="utf-8")
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    script_path = script_dir / "bump_version.py"
+    script_path.write_text(source, encoding="utf-8")
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[project]\nversion = "0.2.0"\n', encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("bump_version_script", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "__file__", str(script_path))
+    monkeypatch.setattr(module.sys, "argv", [str(script_path), "minor"])
+
+    try:
+        exit_code = module.main()
+    finally:
+        monkeypatch.undo()
+
+    assert exit_code == 0
+    assert 'version = "0.3.0"' in pyproject.read_text(encoding="utf-8")

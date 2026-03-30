@@ -1,5 +1,5 @@
 """Transcript CLI package."""
 
-__all__ = ["__version__"]
+from transcript_cli.version import __version__
 
-__version__ = "0.1.0"
+__all__ = ["__version__"]

@@ -31,6 +31,12 @@ Or equivalently:
 uv tool upgrade transcribe
 ```
 
+Show the installed tool version:
+
+```bash
+transcribe --version
+```
+
 ## Running The Latest Local Code
 
 When you run the globally installed command:
@@ -57,6 +63,7 @@ Recommended workflow:
 
 - during development: use `uv run transcribe ...`
 - when you want to refresh the globally installed command from GitHub: run `make upgrade-tool`
+- when you want to verify what is installed: run `transcribe --version`
 
 ## Usage
 
@@ -130,6 +137,28 @@ Upgrade the installed CLI from GitHub:
 ```bash
 make upgrade-tool
 ```
+
+Bump the release version intentionally:
+
+```bash
+make release-patch
+make release-minor
+make release-major
+```
+
+Recommended release workflow:
+
+1. Run one of the `make release-*` targets
+2. Commit the version bump
+3. Push to GitHub
+4. Run `make upgrade-tool` on any machine that should pick up the new release
+5. Verify with `transcribe --version`
+
+Notes:
+
+- pushing to `main` does not automatically change the semantic version
+- `pyproject.toml` is the authoritative source for the package version
+- `transcribe --version` may also include a short Git commit when install metadata provides it
 
 Run checks:
 

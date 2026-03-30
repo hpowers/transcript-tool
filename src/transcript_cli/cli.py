@@ -14,12 +14,21 @@ from transcript_cli.core import (
     detect_speaker_labels,
     run_transcription,
 )
+from transcript_cli.version import format_version_output
 
 app = typer.Typer(
     add_completion=False,
     help="Generate ElevenLabs transcripts from one or more local audio files.",
     no_args_is_help=True,
 )
+
+
+def version_callback(value: bool) -> None:
+    """Print the CLI version and exit."""
+    if not value:
+        return
+    typer.echo(format_version_output())
+    raise typer.Exit()
 
 
 @app.command()
@@ -31,6 +40,16 @@ def main(
             help="One file for diarization, or multiple files for multichannel transcription.",
         ),
     ],
+    version: Annotated[
+        bool | None,
+        typer.Option(
+            "--version",
+            "-V",
+            callback=version_callback,
+            is_eager=True,
+            help="Show the installed transcribe version and exit.",
+        ),
+    ] = None,
     output_dir: Annotated[
         Path,
         typer.Option(
