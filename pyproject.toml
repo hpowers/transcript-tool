@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "transcript-cli"
+version = "0.1.0"
+description = "CLI for generating ElevenLabs transcripts from single or multitrack audio inputs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "elevenlabs>=2.21.0",
+  "typer>=0.16.1",
+]
+
+[project.scripts]
+transcribe = "transcript_cli.cli:app"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18.2",
+  "pytest>=8.4.2",
+  "ruff>=0.13.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transcript_cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+pretty = true
+show_error_codes = true
+warn_unreachable = true
+packages = ["transcript_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

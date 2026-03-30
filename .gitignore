@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.envrc
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pyc
+*.pyo
+*.wav
+transcript_raw.json
+transcript_conversation.txt
+DEMO/
